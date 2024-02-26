@@ -8,8 +8,10 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -63,16 +65,43 @@ func start(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	wg := sync.WaitGroup{}
+	var watchers []*fsnotify.Watcher
 	for _, dir := range dirEntries {
 		if !dir.IsDir() {
 			continue
 		}
-		_, err := watchDir(ctx, filepath.Join(sourceDir, dir.Name()), dir.Name()+":")
+		watcher, err := watchDir(ctx, filepath.Join(sourceDir, dir.Name()), dir.Name()+":", &wg)
 		if err != nil {
 			return err
 		}
+		watchers = append(watchers, watcher)
 	}
-	select {}
+
+	terminate := make(chan os.Signal, 1)
+	signal.Notify(terminate, os.Interrupt)
+	<-terminate
+	signal.Reset(os.Interrupt)
+	slog.Info("shutting down gracefully, waiting for operations to complete")
+
+	for _, w := range watchers {
+		w.Close()
+	}
+	complete := make(chan struct{})
+	go func() {
+		defer func() {
+			close(complete)
+		}()
+		wg.Wait()
+	}()
+	select {
+	case <-time.After(30 * time.Second):
+		return context.DeadlineExceeded
+	case <-complete:
+		slog.Info("shutting down gracefully; exiting")
+		return nil
+	}
 }
 
 func fileAllowCopy(filename string) bool {
@@ -82,7 +111,7 @@ func fileAllowCopy(filename string) bool {
 	return true
 }
 
-func watchDir(ctx *cli.Context, watchDir, targetServer string) (*fsnotify.Watcher, error) {
+func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -97,9 +126,8 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string) (*fsnotify.Watche
 					return
 				}
 				if event.Has(fsnotify.Create) {
-					slog.Info("filevent", "event", event)
 					if fileAllowCopy(event.Name) {
-						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("rm") /*remove files*/)
+						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("rm") /*remove files*/, wg)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -112,7 +140,7 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string) (*fsnotify.Watche
 		}
 	}()
 
-	slog.Info("watching", "dir", watchDir)
+	slog.Info("watching", "dir", watchDir, "rm", ctx.Bool("rm"))
 	err = watcher.Add(watchDir)
 	if err != nil {
 		return watcher, err
@@ -124,13 +152,14 @@ var (
 	localClient tailscale.LocalClient // in-memory
 )
 
-func tsCopyFilesAsync(ctx context.Context, files []string, target string, removeOnComplete bool) {
+func tsCopyFilesAsync(ctx context.Context, files []string, target string, removeOnComplete bool, wg *sync.WaitGroup) {
+	wg.Add(1)
 	start := time.Now()
 	slog.Info("tailscale copy files", "files", files, "target", target)
 	defer func() {
 		slog.Info("tailscale copy files complete", "files", files, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
+		wg.Done()
 	}()
-
 	if err := tsCopyFiles(ctx, files, target, removeOnComplete); err != nil {
 		slog.Error("tailscale copy error", "err", err)
 	}
