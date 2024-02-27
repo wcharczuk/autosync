@@ -7,3 +7,7 @@ install:
 	@defaults write ${HOME}/Library/LaunchAgents/com.charczuk.ts_autosync.plist ProgramArguments -array /usr/local/bin/ts_autosync --source ${HOME}/autosync --rm
 	@defaults write ${HOME}/Library/LaunchAgents/com.charczuk.ts_autosync.plist StandardErrorPath "${HOME}/Library/Logs/ts_autosync.log"
 	@launchctl load -w ${HOME}/Library/LaunchAgents/com.charczuk.ts_autosync.plist
+
+uninstall:
+	@launchctl unload -w ${HOME}/Library/LaunchAgents/com.charczuk.ts_autosync.plist
+	@sudo rm /usr/local/bin/ts_autosync

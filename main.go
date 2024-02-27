@@ -83,7 +83,7 @@ func start(ctx *cli.Context) error {
 	signal.Notify(terminate, os.Interrupt)
 	<-terminate
 	signal.Reset(os.Interrupt)
-	slog.Info("shutting down gracefully, waiting for operations to complete")
+	slog.Info("shutting down gracefully, waiting 30s for operations to complete")
 
 	for _, w := range watchers {
 		w.Close()
@@ -95,6 +95,7 @@ func start(ctx *cli.Context) error {
 		}()
 		wg.Wait()
 	}()
+
 	select {
 	case <-time.After(30 * time.Second):
 		return context.DeadlineExceeded
@@ -208,14 +209,20 @@ func tsCopyFiles(ctx context.Context, files []string, target string, removeOnCom
 		}
 		fileArg := filepath.Base(file)
 		contentLength := fi.Size()
+
+		start := time.Now()
+
+		slog.Info("tailscale copy file", "file", file, "target", target)
 		err = localClient.PushFile(ctx, stableID, contentLength, fileArg, f)
 		if err != nil {
 			return err
 		}
+		slog.Info("tailscale copy file complete!", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
 		if removeOnComplete {
 			if err = os.Remove(file); err != nil {
 				return err
 			}
+			slog.Info("tailscale copy removed", "file", file, "target", target)
 		}
 	}
 	return nil
