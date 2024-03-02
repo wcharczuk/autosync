@@ -1,4 +1,4 @@
-module autosync
+module github.com/wcharczuk/autosync
 
 go 1.22.0
 
