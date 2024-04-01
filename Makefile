@@ -1,5 +1,9 @@
 all: install
 
+build:
+	@go build -o ts_autosync main.go
+	@sudo mv ts_autosync /usr/local/bin/ts_autosync
+
 install:
 	@go build -o ts_autosync main.go
 	@sudo mv ts_autosync /usr/local/bin/ts_autosync

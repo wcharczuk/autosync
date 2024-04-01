@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -36,8 +37,9 @@ func main() {
 				Usage: "the directory to watch for changes",
 			},
 			&cli.BoolFlag{
-				Name:  "rm",
-				Usage: "if we should remove files once they're done copying",
+				Name:    "remove-files",
+				Aliases: []string{"rm"},
+				Usage:   "if we should remove files once they're done copying",
 			},
 		},
 		Action: start,
@@ -49,8 +51,20 @@ func main() {
 	}
 }
 
+func must[A any](v A, err error) A {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 func start(ctx *cli.Context) error {
 	sourceDir := ctx.String("source")
+
+	slog.Info("starting autosync", "pid", os.Getpid())
+	slog.Info("using", "remove-files", ctx.Bool("remove-files"))
+	slog.Info("using", "source", sourceDir)
+
 	if sourceDir == "" {
 		pwd, err := os.Getwd()
 		if err != nil {
@@ -66,13 +80,16 @@ func start(ctx *cli.Context) error {
 		return err
 	}
 
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
 	wg := sync.WaitGroup{}
 	var watchers []*fsnotify.Watcher
 	for _, dir := range dirEntries {
 		if !dir.IsDir() {
 			continue
 		}
-		watcher, err := watchDir(ctx, filepath.Join(sourceDir, dir.Name()), dir.Name()+":", &wg)
+		watcher, err := watchDir(ctx, filepath.Join(sourceDir, dir.Name()), dir.Name()+":", &wg, hup)
 		if err != nil {
 			return err
 		}
@@ -83,6 +100,7 @@ func start(ctx *cli.Context) error {
 	signal.Notify(terminate, os.Interrupt)
 	<-terminate
 	signal.Reset(os.Interrupt)
+	signal.Reset(syscall.SIGHUP)
 	slog.Info("shutting down gracefully, waiting 30s for operations to complete")
 
 	for _, w := range watchers {
@@ -112,7 +130,7 @@ func fileAllowCopy(filename string) bool {
 	return true
 }
 
-func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup) (*fsnotify.Watcher, error) {
+func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup, hup <-chan os.Signal) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -121,6 +139,10 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 		slog.Info("eventloop starting")
 		for {
 			select {
+			case <-hup:
+				if err := scanForStaleFiles(ctx, watchDir, targetServer, wg); err != nil {
+					slog.Error("scane for stale files error", "err", err)
+				}
 			case event, ok := <-watcher.Events:
 				if !ok {
 					slog.Info("eventloop exiting")
@@ -128,7 +150,7 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 				}
 				if event.Has(fsnotify.Create) {
 					if fileAllowCopy(event.Name) {
-						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("rm") /*remove files*/, wg)
+						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -141,12 +163,33 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 		}
 	}()
 
-	slog.Info("watching", "dir", watchDir, "rm", ctx.Bool("rm"))
+	slog.Info("watching", "dir", watchDir)
 	err = watcher.Add(watchDir)
 	if err != nil {
 		return watcher, err
 	}
 	return watcher, nil
+}
+
+func scanForStaleFiles(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup) error {
+	slog.Info("scanning for stale files")
+	defer func() {
+		slog.Info("scanning for stale files done!")
+	}()
+	files, err := os.ReadDir(watchDir)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		if !fileAllowCopy(f.Name()) {
+			continue
+		}
+		go tsCopyFilesAsync(ctx.Context, []string{filepath.Join(watchDir, f.Name())}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
+	}
+	return nil
 }
 
 var (
