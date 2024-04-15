@@ -130,6 +130,30 @@ func fileAllowCopy(filename string) bool {
 	return true
 }
 
+var (
+	fileInProgress   = make(map[string]time.Time)
+	fileInProgressMu sync.Mutex
+)
+
+func markInProgress(path string) bool {
+	fileInProgressMu.Lock()
+	defer fileInProgressMu.Unlock()
+	if _, ok := fileInProgress[path]; ok {
+		return false
+	}
+	fileInProgress[path] = time.Now()
+	return true
+}
+
+func markDone(paths ...string) {
+	fileInProgressMu.Lock()
+	defer fileInProgressMu.Unlock()
+
+	for _, path := range paths {
+		delete(fileInProgress, path)
+	}
+}
+
 func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup, hup <-chan os.Signal) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -149,7 +173,7 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 					return
 				}
 				if event.Has(fsnotify.Create) {
-					if fileAllowCopy(event.Name) {
+					if fileAllowCopy(event.Name) && markInProgress(event.Name) {
 						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
 					}
 				}
@@ -187,7 +211,10 @@ func scanForStaleFiles(ctx *cli.Context, watchDir, targetServer string, wg *sync
 		if !fileAllowCopy(f.Name()) {
 			continue
 		}
-		go tsCopyFilesAsync(ctx.Context, []string{filepath.Join(watchDir, f.Name())}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
+		pathToCopy := filepath.Join(watchDir, f.Name())
+		if markInProgress(pathToCopy) {
+			go tsCopyFilesAsync(ctx.Context, []string{pathToCopy}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
+		}
 	}
 	return nil
 }
@@ -202,6 +229,7 @@ func tsCopyFilesAsync(ctx context.Context, files []string, target string, remove
 	slog.Info("tailscale copy files", "files", files, "target", target)
 	defer func() {
 		slog.Info("tailscale copy files complete", "files", files, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
+		markDone(files...)
 		wg.Done()
 	}()
 	if err := tsCopyFiles(ctx, files, target, removeOnComplete); err != nil {
@@ -236,7 +264,6 @@ func tsCopyFiles(ctx context.Context, files []string, target string, removeOnCom
 	if isOffline {
 		slog.Error("tailscale: warning host is offline", "target", target)
 	}
-
 	for _, file := range files {
 		f, err := os.Open(file)
 		if err != nil {
