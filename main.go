@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
-
 	"golang.org/x/net/idna"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
@@ -131,27 +131,41 @@ func fileAllowCopy(filename string) bool {
 }
 
 var (
-	fileInProgress   = make(map[string]time.Time)
+	fileInProgress   = make(map[string]*watchedFileForCopy)
 	fileInProgressMu sync.Mutex
+	localClient      tailscale.LocalClient // in-memory
 )
 
-func markInProgress(path string) bool {
-	fileInProgressMu.Lock()
-	defer fileInProgressMu.Unlock()
-	if _, ok := fileInProgress[path]; ok {
-		return false
-	}
-	fileInProgress[path] = time.Now()
-	return true
+type watchedFileForCopy struct {
+	Path            string
+	StartedWatching time.Time
+	LastChecked     time.Time
+	Stat            fs.FileInfo
 }
 
-func markDone(paths ...string) {
+func markInProgress(path string, stat fs.FileInfo) (readyToCopy bool) {
 	fileInProgressMu.Lock()
 	defer fileInProgressMu.Unlock()
-
-	for _, path := range paths {
-		delete(fileInProgress, path)
+	now := time.Now()
+	if _, ok := fileInProgress[path]; ok {
+		fileInProgress[path].LastChecked = now
+		fileInProgress[path].Stat = stat
+		readyToCopy = now.Sub(stat.ModTime()) > 5*time.Second
+		return
 	}
+	fileInProgress[path] = &watchedFileForCopy{
+		Path:            path,
+		Stat:            stat,
+		StartedWatching: now,
+		LastChecked:     now,
+	}
+	return
+}
+
+func markDone(path string) {
+	fileInProgressMu.Lock()
+	defer fileInProgressMu.Unlock()
+	delete(fileInProgress, path)
 }
 
 func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup, hup <-chan os.Signal) (*fsnotify.Watcher, error) {
@@ -173,8 +187,13 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 					return
 				}
 				if event.Has(fsnotify.Create) {
-					if fileAllowCopy(event.Name) && markInProgress(event.Name) {
-						go tsCopyFilesAsync(ctx.Context, []string{event.Name}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
+					stat, err := os.Stat(event.Name)
+					if err != nil {
+						slog.Error("cannot stat file", "err", err)
+						continue
+					}
+					if fileAllowCopy(event.Name) && markInProgress(event.Name, stat) {
+						go tsCopyFilesAsync(ctx.Context, event.Name, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -219,20 +238,39 @@ func scanForStaleFiles(ctx *cli.Context, watchDir, targetServer string, wg *sync
 	return nil
 }
 
-var (
-	localClient tailscale.LocalClient // in-memory
-)
-
-func tsCopyFilesAsync(ctx context.Context, files []string, target string, removeOnComplete bool, wg *sync.WaitGroup) {
+func waitForFinishedThenCopy(ctx context.Context, file, target string, removeOnComplete bool, wg *sync.WaitGroup) {
 	wg.Add(1)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Done()
+			return
+		case <-t.C:
+			stat, err := os.Stat(file)
+			if err != nil {
+				slog.Error("file stat error", "err", err)
+				wg.Done()
+				return
+			}
+			if markInProgress(file, stat) {
+				copyFile(ctx, file, target, removeOnComplete, wg)
+			}
+		}
+	}
+
+}
+
+func copyFile(ctx context.Context, file, target string, removeOnComplete bool, wg *sync.WaitGroup) {
 	start := time.Now()
-	slog.Info("tailscale copy files", "files", files, "target", target)
+	slog.Info("tailscale copy file", "files", file, "target", target)
 	defer func() {
-		slog.Info("tailscale copy files complete", "files", files, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
-		markDone(files...)
+		slog.Info("tailscale copy files complete", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
+		markDone(file)
 		wg.Done()
 	}()
-	if err := tsCopyFiles(ctx, files, target, removeOnComplete); err != nil {
+	if err := tsCopyFiles(ctx, []string{file}, target, removeOnComplete); err != nil {
 		slog.Error("tailscale copy error", "err", err)
 	}
 }
