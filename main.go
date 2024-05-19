@@ -27,6 +27,10 @@ import (
 	"tailscale.com/util/dnsname"
 )
 
+const (
+	FILE_CHANGE_DELAY = 5 * time.Second
+)
+
 func main() {
 	app := &cli.App{
 		Name:  "autosync",
@@ -123,49 +127,57 @@ func start(ctx *cli.Context) error {
 	}
 }
 
-func fileAllowCopy(filename string) bool {
-	if filepath.Base(filename) == ".DS_Store" {
-		return false
-	}
-	return true
-}
-
 var (
-	fileInProgress   = make(map[string]*watchedFileForCopy)
-	fileInProgressMu sync.Mutex
-	localClient      tailscale.LocalClient // in-memory
+	filesInProgress   = make(map[string]*fileInProgress)
+	filesInProgressMu sync.Mutex
+	localClient       tailscale.LocalClient // in-memory
 )
 
-type watchedFileForCopy struct {
+type fileInProgress struct {
 	Path            string
 	StartedWatching time.Time
 	LastChecked     time.Time
-	Stat            fs.FileInfo
 }
 
-func markInProgress(path string, stat fs.FileInfo) (readyToCopy bool) {
-	fileInProgressMu.Lock()
-	defer fileInProgressMu.Unlock()
-	now := time.Now()
-	if _, ok := fileInProgress[path]; ok {
-		fileInProgress[path].LastChecked = now
-		fileInProgress[path].Stat = stat
-		readyToCopy = now.Sub(stat.ModTime()) > 5*time.Second
+func isFileInProgress(path string) (ok bool) {
+	filesInProgressMu.Lock()
+	defer filesInProgressMu.Unlock()
+	_, ok = filesInProgress[path]
+	return
+}
+
+func checkFileInProgress(path string) (readyToCopy bool, err error) {
+	stat, statErr := os.Stat(path)
+	if statErr != nil {
+		err = fmt.Errorf("unable to stat file: %w", statErr)
 		return
 	}
-	fileInProgress[path] = &watchedFileForCopy{
+	readyToCopy = checkFileInProgressWithStat(path, stat)
+	return
+}
+
+func checkFileInProgressWithStat(path string, stat fs.FileInfo) (readyToCopy bool) {
+	filesInProgressMu.Lock()
+	defer filesInProgressMu.Unlock()
+
+	now := time.Now()
+	if _, ok := filesInProgress[path]; ok {
+		filesInProgress[path].LastChecked = now
+		readyToCopy = now.Sub(stat.ModTime()) >= FILE_CHANGE_DELAY
+		return
+	}
+	filesInProgress[path] = &fileInProgress{
 		Path:            path,
-		Stat:            stat,
 		StartedWatching: now,
 		LastChecked:     now,
 	}
 	return
 }
 
-func markDone(path string) {
-	fileInProgressMu.Lock()
-	defer fileInProgressMu.Unlock()
-	delete(fileInProgress, path)
+func markFileDone(path string) {
+	filesInProgressMu.Lock()
+	defer filesInProgressMu.Unlock()
+	delete(filesInProgress, path)
 }
 
 func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGroup, hup <-chan os.Signal) (*fsnotify.Watcher, error) {
@@ -178,8 +190,10 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 		for {
 			select {
 			case <-hup:
-				if err := scanForStaleFiles(ctx, watchDir, targetServer, wg); err != nil {
-					slog.Error("scane for stale files error", "err", err)
+				if ctx.Bool("remove-files") {
+					if err := scanForStaleFiles(ctx, watchDir, targetServer, wg); err != nil {
+						slog.Error("scan for stale files error", "err", err)
+					}
 				}
 			case event, ok := <-watcher.Events:
 				if !ok {
@@ -187,13 +201,17 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 					return
 				}
 				if event.Has(fsnotify.Create) {
-					stat, err := os.Stat(event.Name)
-					if err != nil {
-						slog.Error("cannot stat file", "err", err)
+					if fileIsDenyListed(event.Name) {
+						slog.Info("file is deny listed, skipping", "file", event.Name)
 						continue
 					}
-					if fileAllowCopy(event.Name) && markInProgress(event.Name, stat) {
-						go tsCopyFilesAsync(ctx.Context, event.Name, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
+					if !isFileInProgress(event.Name) {
+						_, err := checkFileInProgress(event.Name)
+						if err != nil {
+							slog.Error("watch file error", "err", err)
+							continue
+						}
+						go waitForFileFinishedThenCopy(ctx.Context, event.Name, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -219,6 +237,7 @@ func scanForStaleFiles(ctx *cli.Context, watchDir, targetServer string, wg *sync
 	defer func() {
 		slog.Info("scanning for stale files done!")
 	}()
+
 	files, err := os.ReadDir(watchDir)
 	if err != nil {
 		return err
@@ -227,51 +246,50 @@ func scanForStaleFiles(ctx *cli.Context, watchDir, targetServer string, wg *sync
 		if f.IsDir() {
 			continue
 		}
-		if !fileAllowCopy(f.Name()) {
+		if fileIsDenyListed(f.Name()) {
 			continue
 		}
 		pathToCopy := filepath.Join(watchDir, f.Name())
-		if markInProgress(pathToCopy) {
-			go tsCopyFilesAsync(ctx.Context, []string{pathToCopy}, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
-		}
+		go waitForFileFinishedThenCopy(ctx.Context, pathToCopy, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
 	}
 	return nil
 }
 
-func waitForFinishedThenCopy(ctx context.Context, file, target string, removeOnComplete bool, wg *sync.WaitGroup) {
+func waitForFileFinishedThenCopy(ctx context.Context, file, target string, removeOnComplete bool, wg *sync.WaitGroup) {
 	wg.Add(1)
-	t := time.NewTicker(100 * time.Millisecond)
-	defer t.Stop()
+	t := time.NewTicker(500 * time.Millisecond)
+	defer func() {
+		t.Stop()
+		markFileDone(file)
+		wg.Done()
+	}()
+	slog.Info("waiting for file to be done writing before copying", "file", file, "target", target)
 	for {
 		select {
 		case <-ctx.Done():
-			wg.Done()
 			return
 		case <-t.C:
-			stat, err := os.Stat(file)
+			fileIsReady, err := checkFileInProgress(file)
 			if err != nil {
-				slog.Error("file stat error", "err", err)
-				wg.Done()
+				slog.Error("wait file finished error", "err", err)
 				return
 			}
-			if markInProgress(file, stat) {
-				copyFile(ctx, file, target, removeOnComplete, wg)
+			if fileIsReady {
+				copyFile(ctx, file, target, removeOnComplete)
+				return
 			}
 		}
 	}
-
 }
 
-func copyFile(ctx context.Context, file, target string, removeOnComplete bool, wg *sync.WaitGroup) {
+func copyFile(ctx context.Context, file, target string, removeOnComplete bool) {
 	start := time.Now()
-	slog.Info("tailscale copy file", "files", file, "target", target)
+	slog.Info("copy files", "files", file, "target", target)
 	defer func() {
-		slog.Info("tailscale copy files complete", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
-		markDone(file)
-		wg.Done()
+		slog.Info("copy files complete", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
 	}()
 	if err := tsCopyFiles(ctx, []string{file}, target, removeOnComplete); err != nil {
-		slog.Error("tailscale copy error", "err", err)
+		slog.Error("copy error", "err", err)
 	}
 }
 
@@ -320,17 +338,17 @@ func tsCopyFiles(ctx context.Context, files []string, target string, removeOnCom
 
 		start := time.Now()
 
-		slog.Info("tailscale copy file", "file", file, "target", target)
+		slog.Info("tailscale push file", "file", file, "target", target)
 		err = localClient.PushFile(ctx, stableID, contentLength, fileArg, f)
 		if err != nil {
 			return err
 		}
-		slog.Info("tailscale copy file complete!", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
+		slog.Info("tailscale push file complete!", "file", file, "target", target, "elapsed", time.Since(start).Round(time.Millisecond))
 		if removeOnComplete {
 			if err = os.Remove(file); err != nil {
 				return err
 			}
-			slog.Info("tailscale copy removed", "file", file, "target", target)
+			slog.Info("tailscale removed file on push complete", "file", file, "target", target)
 		}
 	}
 	return nil
@@ -429,4 +447,11 @@ func fileTargetErrorDetail(ctx context.Context, ip netip.Addr) error {
 		return fmt.Errorf("unknown target; %v is not a Tailscale IP address", ip)
 	}
 	return errors.New("unknown target; not in your Tailnet")
+}
+
+func fileIsDenyListed(filename string) bool {
+	if filepath.Base(filename) == ".DS_Store" {
+		return true
+	}
+	return false
 }
