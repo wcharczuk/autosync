@@ -50,7 +50,7 @@ func main() {
 	}
 	localClient.Socket = paths.DefaultTailscaledSocket()
 	if err := app.Run(os.Args); err != nil {
-		slog.Error("run error: %v", err)
+		slog.Error("run error: %v", "err", err)
 		os.Exit(1)
 	}
 }
