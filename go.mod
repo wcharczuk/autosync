@@ -6,7 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/urfave/cli/v2 v2.27.1
 	golang.org/x/net v0.27.0
-	tailscale.com v1.76.6
+	tailscale.com v1.78.1
 )
 
 require (
@@ -32,8 +32,8 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/crypto v0.25.0 // indirect
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a // indirect
-	golang.org/x/sync v0.7.0 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/sync v0.9.0 // indirect
+	golang.org/x/sys v0.27.0 // indirect
 	golang.org/x/text v0.16.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 )
