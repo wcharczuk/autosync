@@ -185,14 +185,20 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 	if err != nil {
 		return nil, err
 	}
+
+	var defaultLogTags = []any{
+		slog.String("dir", watchDir),
+		slog.String("srv", strings.TrimSuffix(targetServer, ":")),
+	}
+
 	go func() {
-		slog.Info("eventloop starting")
+		slog.Info("eventloop starting", defaultLogTags...)
 		for {
 			select {
 			case <-hup:
 				if ctx.Bool("remove-files") {
 					if err := scanForStaleFiles(ctx, watchDir, targetServer, wg); err != nil {
-						slog.Error("scan for stale files error", "err", err)
+						slog.Error("scan for stale files error", append(defaultLogTags, slog.Any("err", err))...)
 					}
 				}
 			case event, ok := <-watcher.Events:
@@ -202,13 +208,13 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 				}
 				if event.Has(fsnotify.Create) {
 					if fileIsDenyListed(event.Name) {
-						slog.Info("file is deny listed, skipping", "file", event.Name)
+						slog.Info("file is deny listed, skipping", append(defaultLogTags, slog.String("file", event.Name))...)
 						continue
 					}
 					if !isFileInProgress(event.Name) {
 						_, err := checkFileInProgress(event.Name)
 						if err != nil {
-							slog.Error("watch file error", "err", err)
+							slog.Error("watch file error", append(defaultLogTags, slog.Any("err", err))...)
 							continue
 						}
 						go waitForFileFinishedThenCopy(ctx.Context, event.Name, targetServer, ctx.Bool("remove-files") /*remove files*/, wg)
@@ -216,15 +222,15 @@ func watchDir(ctx *cli.Context, watchDir, targetServer string, wg *sync.WaitGrou
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
-					slog.Info("eventloop exiting")
+					slog.Info("eventloop exiting", defaultLogTags...)
 					return
 				}
-				slog.Error("watcher error", "err", err)
+				slog.Error("watcher error", append(defaultLogTags, slog.Any("err", err))...)
 			}
 		}
 	}()
 
-	slog.Info("watching", "dir", watchDir)
+	slog.Info("watching", defaultLogTags...)
 	err = watcher.Add(watchDir)
 	if err != nil {
 		return watcher, err
